@@ -42,6 +42,8 @@ Executable haskdogs
                       , process-extras
                       , text
                       , unliftio
+                      , Cabal-syntax
+                      , cabal-plan
 
   Ghc-options:        -fwarn-tabs -threaded -rtsopts -Wall -freverse-errors "-with-rtsopts=-N -xn -I10 -Iw60" -Wunused-packages
 
