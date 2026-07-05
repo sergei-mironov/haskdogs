@@ -1,33 +1,50 @@
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE MultiWayIf          #-}
+{-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE TupleSections       #-}
+
 module Main (main) where
 
+import           Cabal.Plan
 import           Control.Applicative
-import           Control.Concurrent    (getNumCapabilities)
+import           Control.Concurrent                (getNumCapabilities)
 import           Control.Exception
 import           Control.Monad
+import           Data.Bifunctor
+import           Data.Either
+import           Data.Functor
 import           Data.List
+import           Data.Map.Strict                   (Map)
+import qualified Data.Map.Strict                   as M
 import           Data.Maybe
-import           Data.Set              (Set)
-import qualified Data.Set              as Set
-import           Data.Text             (Text, pack, unpack)
-import qualified Data.Text             as Text
-import qualified Data.Text.IO          as Text
-import           Data.Version          (showVersion)
+import           Data.Set                          (Set)
+import qualified Data.Set                          as Set
+import           Data.Text                         (Text, pack, unpack)
+import qualified Data.Text                         as Text
+import qualified Data.Text.Encoding                as Text
+import qualified Data.Text.IO                      as Text
+import           Data.Version                      (showVersion)
+import           Distribution.InstalledPackageInfo (InstalledPackageInfo (..),
+                                                    parseInstalledPackageInfo)
+import           Distribution.Pretty
+import           Distribution.Types.ExposedModule
+import           GHC.IsList
 import           Numeric.Natural
 import           Options.Applicative
-import qualified Paths_haskdogs        as Paths
-import           Prelude               hiding (log)
+import qualified Paths_haskdogs                    as Paths
+import           Prelude                           hiding (log)
 import           System.Directory
-import           System.Exit           (ExitCode (..))
+import           System.Exit                       (ExitCode (..))
 import           System.FilePath
 import           System.IO
 import           System.Log.FastLogger
-import           System.Process.Text   (readProcessWithExitCode)
-import           UnliftIO              (pooledMapConcurrentlyN)
+import           System.Process.Text               (readProcessWithExitCode)
+import           UnliftIO                          (concurrently,
+                                                    pooledMapConcurrentlyN)
+import           GHC.Stack
 
 {-
   ___        _   _
@@ -111,7 +128,7 @@ optsParser def_deps_dir def_concurrency = Opts
         short 'n' <>
         metavar "NUM" <>
         value def_concurrency <>
-        help ("Limit number of ghc-pkg processes running at the same time. The default is [" <> show def_concurrency <>"]"))
+        help ("Limit number of processes running at the same time. The default is [" <> show def_concurrency <>"]"))
   <*> flag True False (
         long "quiet" <>
         short 'q' <>
@@ -138,10 +155,10 @@ opts def_deps_dir def_concurrency = info (helper <*> versionParser <*> optsParse
 
 -}
 
-main :: IO()
+main :: HasCallStack => IO ()
 main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr 64) $ \log -> do
 
-  def_deps_dir <- (</> ".haskdogs") <$> getHomeDirectory
+  def_deps_dir <- getXdgDirectory XdgCache "haskdogs"
   nCpu <- getNumCapabilities
   let def_concurrency = floor $ (fromIntegral nCpu :: Float) * 1.1
 
@@ -152,9 +169,9 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
     cli_hasktags_args = words cli_hasktags_args1 <> cli_hasktags_args2
 
     -- Directory to unpack sources into
-    getDataDir :: IO FilePath
+    getDataDir :: HasCallStack => IO FilePath
     getDataDir = do
-      createDirectoryIfMissing False cli_deps_dir
+      createDirectoryIfMissing True cli_deps_dir
       pure cli_deps_dir
 
     vprint a
@@ -163,25 +180,27 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
 
     eprint a = log $ toLogStr (a <> "\n")
 
-    printOut :: Text -> IO ()
+    printOut :: HasCallStack => Text -> IO ()
     printOut a = logStdout $ toLogStr (a <> "\n")
 
+    runp :: HasCallStack => String -> [String] -> Text -> IO Text
     runp nm args inp = snd <$> runp' nm args inp
 
+    runp' :: HasCallStack => String -> [String] -> Text -> IO (String, Text)
     runp' nm args inp = do
       let logLine = "> " <> nm <> " " <> unwords args
       (ec, out, err) <- readProcessWithExitCode nm args inp
       case ec of
         ExitSuccess -> pure (logLine, out)
-        _ -> ioError (userError $ nm <> " " <> show args <> " exited with error code " <> show ec <> " and output:\n" <> init (unpack err))
+        _ -> error $ nm <> " " <> show args <> " exited with error code " <> show ec <> " and output:\n" <> init (unpack err)
 
     -- Run GNU which tool
-    checkapp :: String -> IO ()
+    checkapp :: HasCallStack => String -> IO ()
     checkapp appname =
       void (runp "which" [appname] "") `onException`
         eprint ("Please Install \"" <> appname <> "\" application")
 
-    hasapp :: String -> IO Bool
+    hasapp :: HasCallStack => String -> IO Bool
     hasapp appname = do
         vprint $ "Checking for " <> appname <> " with GNU which"
         (runp "which" [appname] "" >> pure True) `catch`
@@ -190,27 +209,30 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
   when (not (null cli_hasktags_args) && cli_raw_mode) $
     fail "--raw is incompatible with passing hasktags arguments"
 
-  cwd <- getCurrentDirectory
   datadir <- getDataDir
   has_stack <- hasapp "stack"
   has_cabal <- hasapp "cabal"
 
+  extraPkgDbArgs <- if has_cabal
+    then discoverCabalPackageDbs vprint runp
+    else pure []
+
   let
 
-    readLinedFile :: FilePath -> IO [Text]
+    readLinedFile :: HasCallStack => FilePath -> IO [Text]
     readLinedFile f =
       Text.lines <$> (Text.hGetContents =<< (
         if f=="-"
           then pure stdin
           else openFile f ReadMode))
 
-    readDirFile :: IO [FilePath]
+    readDirFile :: HasCallStack => IO [FilePath]
     readDirFile
       | null cli_dirlist_file && null cli_filelist_file && null cli_input_file = pure ["."]
       | null cli_dirlist_file = pure []
       | otherwise = map unpack <$> readLinedFile cli_dirlist_file
 
-    readSourceFile :: IO (Set Text)
+    readSourceFile :: HasCallStack => IO (Set Text)
     readSourceFile = do
       files1 <- if | null cli_filelist_file -> pure Set.empty
                    | otherwise -> Set.fromList <$> readLinedFile cli_filelist_file
@@ -218,32 +240,52 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
                    | otherwise -> pure $ Set.singleton (pack cli_input_file)
       pure $ files1 <> files2
 
+    runp_ghc_pkgs :: HasCallStack => [String] -> IO (String, Text)
     runp_ghc_pkgs args = go cli_use_stack where
       go ON = runp' "stack" (["exec", "ghc-pkg"] <> words cli_stack_args <> ["--"] <> words cli_ghc_pkgs_args <> args) ""
-      go OFF = runp' "ghc-pkg" (words cli_ghc_pkgs_args <> args) ""
+      go OFF = runp' "ghc-pkg" (extraPkgDbArgs <> words cli_ghc_pkgs_args <> args) ""
       go AUTO =
         case (has_stack,has_cabal) of
-          (True,_)      -> go ON
-          (False,True)  -> go OFF
+          (_,True)      -> go OFF
+          (True,False)  -> go ON
           (False,False) -> fail "Either `stack` or `cabal` should be installed"
 
+    dump_ghc_pkgs_db :: HasCallStack => IO (String, Text)
+    dump_ghc_pkgs_db = runp_ghc_pkgs ["--simple-output", "dump"]
+
+    load_ghc_pkgs_db :: HasCallStack => IO (Map Text Text)
+    load_ghc_pkgs_db = do
+      (_, dump) <- dump_ghc_pkgs_db
+      let
+        (failures, pkgs) = partitionEithers . map (parseInstalledPackageInfo . Text.encodeUtf8) $ Text.splitOn "---\n" dump
+        zipVersion InstalledPackageInfo{sourcePackageId, exposedModules} = (,prettyShow sourcePackageId) <$> exposedModules
+        dropReexports = filter (isNothing . exposedReexport . fst)
+        modsPkgs = map (bimap (Text.pack . prettyShow . exposedName) Text.pack) . dropReexports . join $ map (zipVersion . snd) pkgs
+        packagesMap = fromList modsPkgs :: Map Text Text
+
+      unless (null failures) $
+        eprint . intercalate "\n" $ "encountered failures when reading ghc-pkg database:\n" : (("\t\t" <>) <$> (toList =<< failures)) ++ ["\n"]
+
+      pure packagesMap
+
+    cabal_or_stack :: String
     cabal_or_stack = go cli_use_stack where
       go ON = "stack"
       go OFF = "cabal"
       go AUTO =
         case (has_stack,has_cabal) of
-          (True,_)      -> go ON
-          (False,True)  -> go OFF
+          (_,True)      -> go OFF
+          (True,False)  -> go ON
           (False,False) -> fail "Either `stack` or `cabal` should be installed"
 
     -- Finds *hs in dirs, but filter-out Setup.hs
-    findSources :: [FilePath] -> IO (Set Text)
+    findSources :: HasCallStack => [FilePath] -> IO (Set Text)
     findSources [] = return Set.empty
     findSources dirs = do
       mixedPaths <- map Text.unpack . filter (not . Text.isSuffixOf "Setup.hs") . Text.lines <$>
         runp "find" (dirs <> words "-type f -and ( -name *\\.hs -or -name *\\.lhs -or -name *\\.hsc )") ""
       -- use absolute paths because of https://github.com/MarcWeber/hasktags/issues/22
-      Set.fromList . fmap Text.pack <$> traverse canonicalizePath mixedPaths
+      Set.fromList . fmap Text.pack <$> pooledMapConcurrentlyN (fromIntegral cli_limit_concurrency) canonicalizePath mixedPaths
 
     grepImports :: Text -> Maybe Text
     grepImports line =
@@ -253,41 +295,101 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
         _                          -> Nothing
 
     -- Scan input files, produces list of imported modules
-    findModules :: Set Text -> IO [Text]
+    findModules :: HasCallStack => Set Text -> IO [Text]
     findModules files =
-      fmap concat . mapM (fmap (mapMaybe grepImports) . readLinedFile . unpack) $ Set.toList files
+      fmap concat . pooledMapConcurrentlyN (fromIntegral cli_limit_concurrency) (fmap (mapMaybe grepImports) . readLinedFile . unpack) $ Set.toList files
 
     -- Maps import name to haskell package name
-    iname2module :: Text -> IO (Maybe Text)
-    iname2module iname = do
-      (logLine, cmdOut) <- runp_ghc_pkgs ["--simple-output", "find-module", unpack iname]
-      let mod' = listToMaybe $ Text.words cmdOut
-      vprint $ logLine <> "\nImport " <> unpack iname <> " resolved to " <> maybe "NULL" unpack mod'
+    iname2module :: HasCallStack => Map Text Text -> Text -> IO (Maybe Text)
+    iname2module modulesDb iname = do
+      let mod' = M.lookup iname modulesDb
+      vprint $ "Import " <> unpack iname <> " resolved to " <> maybe "NULL" unpack mod'
       pure mod'
 
-    inames2modules :: [Text] -> IO [FilePath]
-    inames2modules inames = do
-      map unpack . nub . sort . catMaybes <$> pooledMapConcurrentlyN (fromIntegral cli_limit_concurrency) iname2module (nub inames)
+    inames2modules :: HasCallStack => Map Text Text -> [Text] -> IO [FilePath]
+    inames2modules modulesDb inames = do
+      let uniqueImports = Set.toAscList $ Set.fromList inames
+      resolved <- mapM (iname2module modulesDb) uniqueImports
+      pure . map unpack . Set.toAscList . Set.fromList $ catMaybes resolved
 
     -- Unapcks haskel package to the sourcedir
-    unpackModule :: FilePath -> IO (Maybe FilePath)
-    unpackModule mod' = do
-      let p = datadir</>mod'
+    unpackModule :: HasCallStack => Maybe (Map Text Unit) -> FilePath -> IO (Maybe FilePath)
+    unpackModule units'm package = do
+      let p = datadir </> package
       exists <- doesDirectoryExist p
       if exists
         then do
-          vprint $ "Already unpacked " <> mod'
+          vprint $ "Already unpacked " <> package
           pure (Just p)
         else
-          bracket_ (setCurrentDirectory datadir) (setCurrentDirectory cwd) $
-            ( runp cabal_or_stack ["unpack", mod'] "" >> pure (Just p)
-            ) `catch`
-            (\(_ :: SomeException) ->
-              eprint ("Can't unpack " <> mod') >> pure Nothing
-            )
+          case units'm >>= M.lookup (Text.pack package) of
+            Just Unit{uPkgSrc=Nothing} -> do
+              vprint $ "Skipping local package " <> package
+              pure Nothing
+            Just Unit{uPkgSrc=Just (LocalUnpackedPackage path)} -> do
+              pathExists <- doesDirectoryExist path
+              if pathExists
+                then do
+                  vprint $ "Found " <> package <> " via plan.json at " <> path
+                  pure (Just path)
+                else do
+                  vprint $ "plan.json path for " <> package <> " doesn't exist: " <> path
+                  pure Nothing
+            Just Unit{uPkgSrc=Just (RepoTarballPackage (RepoSecure (URI repoUri)))} ->
+              fetchFromRepo repoUri
+            Just Unit{uPkgSrc=Just (RepoTarballPackage (RepoRemote (URI repoUri)))} ->
+              fetchFromRepo repoUri
+            Just Unit{uPkgSrc=Just pkgLoc} -> do
+              vprint $ "Unsupported PkgLoc for " <> package <> ": " <> show pkgLoc
+              pure Nothing
+            Nothing ->
+              cabalGet p
+      where
+        cabalGet :: FilePath -> IO (Maybe FilePath)
+        cabalGet p =
+          (do
+            runp cabal_or_stack ["get", package, "-d", datadir] ""
+            pure (Just p)
+          ) `catch`
+          \(e :: SomeException) -> do
+            eprint ("Can't unpack " <> package <> ": " <> show e)
+            pure Nothing
 
-    unpackModules :: [FilePath] -> IO [FilePath]
-    unpackModules ms = catMaybes <$> mapM unpackModule ms
+        fetchFromRepo :: Text -> IO (Maybe FilePath)
+        fetchFromRepo repoUri = do
+          let baseUri = Text.dropWhileEnd (== '/') repoUri
+              tarballUrl = unpack baseUri <> "/package/" <> package <> ".tar.gz"
+              dest = datadir </> package
+          vprint $ "Downloading " <> package <> " from " <> tarballUrl
+          (do
+            runp "sh" ["-c", "curl -sSLf " <> tarballUrl <> " | tar xz -C " <> datadir] ""
+            destExists <- doesDirectoryExist dest
+            if destExists
+              then do
+                vprint $ "Unpacked " <> package <> " from " <> unpack baseUri
+                pure (Just dest)
+              else do
+                vprint $ "Extraction didn't produce " <> dest
+                pure Nothing
+            ) `catch` \(ex :: SomeException) -> do
+              vprint $ "Failed to fetch " <> package <> " from " <> unpack baseUri <> ": " <> show ex
+              pure Nothing
+
+    unpackModules :: HasCallStack => Maybe (Map Text Unit) -> [FilePath] -> IO [FilePath]
+    unpackModules packages'm ms =
+      catMaybes <$> pooledMapConcurrentlyN (fromIntegral cli_limit_concurrency) (unpackModule packages'm) ms
+
+    loadPlanJson :: HasCallStack => IO (Maybe (Map Text Unit))
+    loadPlanJson = do
+      result <- try $ findAndDecodePlanJson (ProjectRelativeToDir ".")
+      case result of
+        Left (err :: SomeException) -> do
+          vprint $ "Couldn't find plan.json - continuing...\n" <> show err
+          pure Nothing
+        Right PlanJson{pjUnits} -> do
+          let unitsMap = M.fromList . map (\u -> (dispPkgId (uPId u), u)) $ M.elems pjUnits
+          vprint $ "Loaded plan.json with " <> show (M.size unitsMap) <> " packages"
+          pure (Just unitsMap)
 
     getFiles :: IO (Set Text)
     getFiles = do
@@ -295,7 +397,10 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
       ss_local <- mappend <$> readSourceFile <*> findSources dirs
       when (null ss_local) $
         fail $ "Haskdogs were not able to find any sources in " <> intercalate ", " dirs
-      ss_l1deps <- findModules ss_local >>= inames2modules >>= unpackModules >>= findSources
+      vprint ("Loading ghc-pkg database and plan.json..." :: Text)
+      (modulesDb, planJson'm) <- concurrently load_ghc_pkgs_db loadPlanJson
+      vprint ("Loaded databases" :: Text)
+      ss_l1deps <- findModules ss_local >>= inames2modules modulesDb >>= unpackModules planJson'm >>= findSources
       pure $ Set.filter (/= "-") ss_local `mappend` ss_l1deps
 
     gentags :: IO ()
@@ -316,3 +421,31 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
 
 withFastLogger1 :: LogType -> (FastLogger -> IO a) -> IO a
 withFastLogger1 typ log' = bracket (newFastLogger1 typ) snd (log' . fst)
+
+discoverCabalPackageDbs :: (String -> IO ()) -> (String -> [String] -> Text -> IO Text) -> IO [String]
+discoverCabalPackageDbs vprint' runp' = do
+  vprint' "Discovering cabal package databases..."
+  mStoreDb <- tryDiscoverStoreDb
+  mProjectDb <- tryDiscoverProjectDb
+  let args = ["--global"]
+        <> maybe [] (\db -> ["--package-db", db]) mStoreDb
+        <> maybe [] (\db -> ["--package-db", db]) mProjectDb
+  vprint' $ "Auto-detected ghc-pkg args: " <> unwords args
+  pure args
+  where
+    tryDiscoverStoreDb :: IO (Maybe FilePath)
+    tryDiscoverStoreDb = (do
+      storeDir <- Text.unpack . Text.strip <$> runp' "cabal" ["path", "--store-dir"] ""
+      ghcId <- Text.unpack . Text.strip <$> runp' "ghc-pkg" ["field", "ghc", "id", "--simple-output", "--global"] ""
+      let db = storeDir </> ghcId </> "package.db"
+      exists <- doesDirectoryExist db
+      pure $ if exists then Just db else Nothing
+      ) `catch` \(_ :: SomeException) -> pure Nothing
+
+    tryDiscoverProjectDb :: IO (Maybe FilePath)
+    tryDiscoverProjectDb = (do
+      ghcVer <- Text.unpack . Text.strip <$> runp' "ghc" ["--numeric-version"] ""
+      let db = "dist-newstyle" </> "packagedb" </> ("ghc-" <> ghcVer)
+      exists <- doesDirectoryExist db
+      pure $ if exists then Just db else Nothing
+      ) `catch` \(_ :: SomeException) -> pure Nothing
